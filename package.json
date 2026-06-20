@@ -1,0 +1,28 @@
+{
+    "name": "cn.yearnstudio.shangcloud.mmo",
+    "version": "1.0.0",
+    "displayName": "ShangCloud MMO SDK",
+    "description": "ShangCloud MMO real-time communication SDK with AES-256-GCM encrypted TCP/UDP/WebSocket transport and HTTP API client.",
+    "unity": "2021.2",
+    "unityRelease": "0f1",
+    "dependencies": {
+        "com.unity.nuget.newtonsoft-json": "3.2.1"
+    },
+    "keywords": [
+        "mmo",
+        "networking",
+        "shangcloud",
+        "multiplayer"
+    ],
+    "author": {
+        "name": "YearnStudio",
+        "url": "https://yearnstudio.cn"
+    },
+    "samples": [
+        {
+            "displayName": "Basic Usage",
+            "description": "Shows how to create/join rooms via API and connect to edge nodes",
+            "path": "Samples~/BasicUsage"
+        }
+    ]
+}
