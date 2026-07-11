@@ -99,18 +99,53 @@ mmo.ConnectToEdge();
 ### 3. 发送和接收消息
 
 ```csharp
-// 连接成功后发送加入消息
+// 连接成功后发送加入消息（封装版，等价于手写 __join__ JSON）
 mmo.OnConnected += () =>
 {
-    mmo.SendMessage("{\"type\":\"__join__\",\"uid\":\"player1\",\"nickname\":\"玩家一\"}");
+    mmo.SendJoinAnnouncement("player1", "玩家一");
 };
 
-// 发送自定义消息
-mmo.SendMessage("Hello World");
+// 发送广播消息（封装版，wire：{"uid","message","extra"}，无 type 字段）
+mmo.SendBroadcast("player1", "Hello World", "");
 
-// 发送二进制数据
+// 发送同步变量（封装版，wire：{"type":"__sync_var__","uid","vars","interp"}）
+// interp 列表中的变量名，接收端应做插帧平滑
+mmo.SendSyncVar("player1", new Dictionary<string, object>
+{
+    { "x", transform.position.x },
+    { "y", transform.position.y },
+}, new[] { "x", "y" });
+
+// 发送原始文本/二进制（底层接口，不经过封装）
+mmo.SendMessage("Hello World");
 byte[] data = new byte[] { 0x01, 0x02, 0x03 };
 mmo.SendRaw(data, data.Length);
+```
+
+### 4. 接收广播与同步变量（封装事件）
+
+```csharp
+mmo.OnBroadcastReceived += (uid, message, extra) =>
+    Debug.Log($"广播 {uid}: {message} (extra={extra})");
+
+mmo.OnSyncVarReceived += (uid, vars, interp) =>
+{
+    Debug.Log($"同步变量 {uid}: {vars.Count} 项，插帧: [{string.Join(",", interp)}]");
+    // vars: IDictionary<string,string>，interp: IReadOnlyList<string>
+    if (vars.TryGetValue("x", out var xStr) && float.TryParse(xStr, out float x))
+        // 应用 x ...
+        Debug.Log($"x = {x}");
+};
+
+// 逐帧平滑推进（移植自 core.js 的 _ensureInterpLoop）
+mmo.OnSyncVarInterpolated += (uid, varName, value) =>
+{
+    // 在此回写场景对象，例如移动对应 uid 的克隆体
+    // if (varName == "x") clone.position = new Vector3((float)value, clone.position.y, 0);
+};
+
+// 也可在任意时刻直接读取平滑后的值
+double currentX = mmo.GetSyncVar("player1", "x");
 ```
 
 ## API 客户端详细用法
@@ -194,8 +229,11 @@ catch (ShangCloudApiException ex)
 | `OnConnected` | `Action` | 连接成功，已通过认证 |
 | `OnDisconnected` | `Action` | 连接断开 |
 | `OnConnectionError` | `Action<string>` | 连接错误，参数为错误描述 |
-| `OnMessageReceived` | `Action<string>` | 收到业务消息 |
+| `OnMessageReceived` | `Action<string>` | 收到未识别为广播/同步变量的业务消息 |
 | `OnRawMessageReceived` | `Action<byte[], int>` | 收到二进制消息，参数为缓冲区和有效长度 |
+| `OnBroadcastReceived` | `Action<string,string,string>` | 收到广播消息 `(uid, message, extra)`（wire：`{"uid","message","extra"}`） |
+| `OnSyncVarReceived` | `Action<string,IDictionary<string,string>,IReadOnlyList<string>>` | 收到同步变量 `(uid, vars, interp)`（wire：`__sync_var__`） |
+| `OnSyncVarInterpolated` | `Action<string,string,double>` | 插帧引擎逐帧推进时触发 `(uid, varName, value)`，回写场景对象即可（移植自 core.js 的 `_ensureInterpLoop`） |
 | `OnUserJoined` | `Action<string, string>` | 用户加入房间，参数为 uid 和 nickname |
 | `OnUserLeft` | `Action<string>` | 用户离开房间，参数为 uid |
 | `OnServerClosed` | `Action` | 服务端主动关闭连接 |
@@ -207,8 +245,14 @@ catch (ShangCloudApiException ex)
 | `ConfigureFromApiResponse(connectKey, edgeUrl, protocol)` | 从 API 响应配置连接参数 |
 | `ConnectToEdge()` | 连接到边缘节点 |
 | `DisconnectFromEdge()` | 断开连接 |
-| `SendMessage(string)` | 发送文本消息 |
+| `SendMessage(string)` | 发送原始文本消息（明文帧，不经过封装） |
 | `SendRaw(byte[], int)` | 发送二进制数据 |
+| `SendBroadcast(uid, message, extra)` | 封装广播，wire：`{"uid","message","extra"}` |
+| `SendSyncVar(uid, vars, interp)` | 封装同步变量，wire：`{"type":"__sync_var__","uid","vars","interp"}` |
+| `SendJoinAnnouncement(uid, nickname)` | 封装加入通知，wire：`{"type":"__join__","uid","nickname"}` |
+| `GetSyncVar(uid, varName) -> double` | 读取插帧变量平滑后的当前值（移植自 core.js 的插帧引擎） |
+| `GetSyncVarRaw(uid, varName) -> string` | 读取同步变量原始值（不做插帧） |
+| `ClearSyncVarState(uid)` | 清理指定 uid 的插帧状态（玩家离开时调用） |
 
 ## 通信协议
 
