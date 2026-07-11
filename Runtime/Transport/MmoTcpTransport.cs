@@ -1,14 +1,40 @@
 using System;
+#if !UNITY_WEBGL
 using System.Buffers;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 using ShangCloud.MMO.Crypto;
-using ShangCloud.MMO.Threading;
+#endif
 
 namespace ShangCloud.MMO.Transport
 {
+#if UNITY_WEBGL
+    public class MmoTcpTransport : MmoTransportBase
+    {
+        public override void Connect(string host, int port, string connectKey)
+        {
+            _connectKey = connectKey;
+            _state = MmoConnectionState.Error;
+            RaiseError("TCP transport is not supported on WebGL platform. Use a native platform build or a WebSocket transport implementation.");
+            RaiseDisconnected();
+        }
+
+        public override void Disconnect()
+        {
+            _state = MmoConnectionState.Disconnected;
+        }
+
+        public override void Poll(float deltaTime)
+        {
+        }
+
+        public override void Send(byte[] data, int length)
+        {
+        }
+    }
+#else
     public class MmoTcpTransport : MmoTransportBase
     {
         private Socket _socket;
@@ -88,8 +114,7 @@ namespace ShangCloud.MMO.Transport
                 // overload throws "Operation is not supported on this platform" on
                 // Unity/Mono; Socket.Connect(IPEndPoint) does not.
                 IPAddress target = ResolveHost(host);
-                _socket = new Socket(target.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
-                _socket.Connect(new IPEndPoint(target, port));
+                _socket = ConnectSocket(target, port);
 
                 // Step 1: Send 32-byte seed (plaintext)
                 byte[] seed = MmoCrypto.GenerateSeed();
@@ -119,9 +144,85 @@ namespace ShangCloud.MMO.Transport
             {
                 if (_disposed || _state == MmoConnectionState.Disconnected) return;
                 _state = MmoConnectionState.Error;
-                RaiseError($"TCP connection error: {ex.Message}");
+                RaiseError($"TCP connection error: {GetConnectionErrorMessage(ex)}");
                 RaiseDisconnected();
             }
+        }
+
+        private Socket ConnectSocket(IPAddress target, int port)
+        {
+            var endPoint = new IPEndPoint(target, port);
+            Socket sock = new Socket(target.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+            try
+            {
+                sock.Connect(endPoint);
+                return sock;
+            }
+            catch (Exception ex)
+            {
+                try { sock.Close(); } catch { }
+                if (ShouldRetryWithAsyncConnect(ex))
+                    return ConnectSocketAsync(endPoint);
+
+                throw;
+            }
+        }
+
+        private Socket ConnectSocketAsync(IPEndPoint endPoint)
+        {
+            Socket sock = new Socket(endPoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+            IAsyncResult result = null;
+            try
+            {
+                result = sock.BeginConnect(endPoint, null, null);
+                if (!result.AsyncWaitHandle.WaitOne(TimeSpan.FromSeconds(10)))
+                    throw new TimeoutException("TCP connection timed out");
+
+                sock.EndConnect(result);
+                return sock;
+            }
+            catch
+            {
+                try { sock.Close(); } catch { }
+                throw;
+            }
+            finally
+            {
+                try { result?.AsyncWaitHandle.Close(); } catch { }
+            }
+        }
+
+        private bool ShouldRetryWithAsyncConnect(Exception ex)
+        {
+            var socketEx = ex as SocketException;
+            if (socketEx != null)
+            {
+                return socketEx.SocketErrorCode == SocketError.OperationNotSupported ||
+                       socketEx.ErrorCode == 10045;
+            }
+
+            return ex is NotSupportedException || ex is PlatformNotSupportedException;
+        }
+
+        private string GetConnectionErrorMessage(Exception ex)
+        {
+            if (IsPlatformNotSupported(ex))
+            {
+                return "TCP sockets are not supported on this platform. Use a native platform build or a WebSocket transport implementation.";
+            }
+
+            return ex.Message;
+        }
+
+        private bool IsPlatformNotSupported(Exception ex)
+        {
+            if (ex is PlatformNotSupportedException || ex is NotSupportedException)
+                return true;
+
+            var socketEx = ex as SocketException;
+            return socketEx != null &&
+                   (socketEx.SocketErrorCode == SocketError.OperationNotSupported ||
+                    socketEx.ErrorCode == 10045);
         }
 
         private IPAddress ResolveHost(string host)
@@ -284,4 +385,5 @@ namespace ShangCloud.MMO.Transport
             }
         }
     }
+#endif
 }

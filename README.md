@@ -96,7 +96,25 @@ mmo.ConfigureFromApiResponse(room.ConnectKey, room.EdgeUrl, room.Protocol);
 mmo.ConnectToEdge();
 ```
 
-### 3. 发送和接收消息
+### 3. 手动连接 MMO 节点
+
+如果已经有节点地址、端口和连接密钥，可以绕过 HTTP API 响应直接连接：
+
+```csharp
+using ShangCloud.MMO.Transport;
+
+// 默认使用 TCP
+mmo.ConnectToEdge("127.0.0.1", 9000, "your_connect_key");
+
+// 指定 TCP / UDP
+mmo.ConnectToEdge(MmoProtocol.TCP, "127.0.0.1", 9000, "your_connect_key");
+mmo.ConnectToEdge(MmoProtocol.UDP, "127.0.0.1", 9000, "your_connect_key");
+
+// WebSocket 使用完整 URL
+mmo.ConnectToWebSocketEdge("wss://example.com/ws", "your_connect_key");
+```
+
+### 4. 发送和接收消息
 
 ```csharp
 // 连接成功后发送加入消息（封装版，等价于手写 __join__ JSON）
@@ -122,7 +140,7 @@ byte[] data = new byte[] { 0x01, 0x02, 0x03 };
 mmo.SendRaw(data, data.Length);
 ```
 
-### 4. 接收广播与同步变量（封装事件）
+### 5. 接收广播与同步变量（封装事件）
 
 ```csharp
 mmo.OnBroadcastReceived += (uid, message, extra) =>
@@ -244,6 +262,9 @@ catch (ShangCloudApiException ex)
 |------|------|
 | `ConfigureFromApiResponse(connectKey, edgeUrl, protocol)` | 从 API 响应配置连接参数 |
 | `ConnectToEdge()` | 连接到边缘节点 |
+| `ConnectToEdge(host, port, connectKey)` | 使用 TCP 手动连接到指定 MMO 节点 |
+| `ConnectToEdge(protocol, host, port, connectKey)` | 使用 TCP/UDP/WebSocket(host+port) 手动连接到指定 MMO 节点 |
+| `ConnectToWebSocketEdge(websocketUrl, connectKey)` | 使用完整 WebSocket URL 手动连接到指定 MMO 节点 |
 | `DisconnectFromEdge()` | 断开连接 |
 | `SendMessage(string)` | 发送原始文本消息（明文帧，不经过封装） |
 | `SendRaw(byte[], int)` | 发送二进制数据 |

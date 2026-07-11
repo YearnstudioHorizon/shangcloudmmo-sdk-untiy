@@ -80,54 +80,126 @@ namespace ShangCloud.MMO
 
         public void ConnectToEdge()
         {
-            if (string.IsNullOrEmpty(connectKey))
+            ConnectInternal(protocol, edgeHost, edgePort, connectKey, edgeUrl);
+        }
+
+        /// <summary>
+        /// Connects directly to an MMO edge node without using an API response.
+        /// </summary>
+        public void ConnectToEdge(string host, int port, string connectionKey)
+        {
+            ConnectToEdge(MmoProtocol.TCP, host, port, connectionKey);
+        }
+
+        /// <summary>
+        /// Connects directly to an MMO edge node without using an API response.
+        /// For WebSocket, this overload connects to ws://host:port/ws.
+        /// </summary>
+        public void ConnectToEdge(MmoProtocol connectionProtocol, string host, int port, string connectionKey)
+        {
+            protocol = connectionProtocol;
+            connectKey = connectionKey;
+            edgeHost = host;
+            edgePort = port;
+            edgeUrl = null;
+
+            ConnectInternal(connectionProtocol, host, port, connectionKey, null);
+        }
+
+        /// <summary>
+        /// Connects directly to a WebSocket MMO edge URL without using an API response.
+        /// </summary>
+        public void ConnectToWebSocketEdge(string websocketUrl, string connectionKey)
+        {
+            protocol = MmoProtocol.WebSocket;
+            connectKey = connectionKey;
+            edgeUrl = websocketUrl;
+            ParseEdgeUrl(websocketUrl);
+
+            ConnectInternal(MmoProtocol.WebSocket, edgeHost, edgePort, connectionKey, websocketUrl);
+        }
+
+        private void ConnectInternal(MmoProtocol connectionProtocol, string host, int port, string connectionKey, string websocketUrl)
+        {
+            if (string.IsNullOrEmpty(connectionKey))
             {
                 Debug.LogError("ShangCloudMMO: connect_key must be set before connecting");
                 return;
             }
 
+            if (connectionProtocol == MmoProtocol.WebSocket)
+            {
+                if (string.IsNullOrEmpty(websocketUrl) && (string.IsNullOrEmpty(host) || port <= 0))
+                {
+                    Debug.LogError("ShangCloudMMO: edge_url or edge_host and edge_port must be set before connecting");
+                    return;
+                }
+            }
+            else if (string.IsNullOrEmpty(host) || port <= 0)
+            {
+                Debug.LogError("ShangCloudMMO: edge_host and edge_port must be set before connecting");
+                return;
+            }
+
             CleanupTransport();
 
-            switch (protocol)
+            _transport = CreateTransport(connectionProtocol);
+            if (_transport == null)
+                return;
+
+            AttachTransportEvents(_transport);
+
+            if (connectionProtocol == MmoProtocol.WebSocket && !string.IsNullOrEmpty(websocketUrl))
+            {
+#if UNITY_WEBGL
+                Debug.LogError("ShangCloudMMO: WebSocket transport is not supported on WebGL platform");
+#else
+                ((MmoWebSocketTransport)_transport).Connect(websocketUrl, connectionKey);
+#endif
+                return;
+            }
+
+            _transport.Connect(host, port, connectionKey);
+        }
+
+        private IMmoTransport CreateTransport(MmoProtocol connectionProtocol)
+        {
+            switch (connectionProtocol)
             {
                 case MmoProtocol.TCP:
-                    _transport = new MmoTcpTransport();
-                    break;
+#if UNITY_WEBGL
+                    Debug.LogError("ShangCloudMMO: TCP transport is not supported on WebGL platform");
+                    return null;
+#else
+                    return new MmoTcpTransport();
+#endif
                 case MmoProtocol.UDP:
-                    _transport = new MmoUdpTransport();
-                    break;
+#if UNITY_WEBGL
+                    Debug.LogError("ShangCloudMMO: UDP transport is not supported on WebGL platform");
+                    return null;
+#else
+                    return new MmoUdpTransport();
+#endif
                 case MmoProtocol.WebSocket:
 #if UNITY_WEBGL
                     Debug.LogError("ShangCloudMMO: WebSocket transport is not supported on WebGL platform");
-                    return;
+                    return null;
 #else
-                    var wsTransport = new MmoWebSocketTransport();
-                    _transport = wsTransport;
-                    break;
+                    return new MmoWebSocketTransport();
 #endif
+                default:
+                    Debug.LogError($"ShangCloudMMO: unsupported protocol {connectionProtocol}");
+                    return null;
             }
+        }
 
-            _transport.SetMessageQueue(_messageQueue);
-            _transport.OnConnected += () => OnConnected?.Invoke();
-            _transport.OnDisconnected += () => OnDisconnected?.Invoke();
-            _transport.OnError += err => OnConnectionError?.Invoke(err);
-            _transport.OnServerClosed += () => OnServerClosed?.Invoke();
-
-            if (protocol == MmoProtocol.WebSocket && !string.IsNullOrEmpty(edgeUrl))
-            {
-#if !UNITY_WEBGL
-                ((MmoWebSocketTransport)_transport).Connect(edgeUrl, connectKey);
-#endif
-            }
-            else
-            {
-                if (string.IsNullOrEmpty(edgeHost) || edgePort <= 0)
-                {
-                    Debug.LogError("ShangCloudMMO: edge_host and edge_port must be set before connecting");
-                    return;
-                }
-                _transport.Connect(edgeHost, edgePort, connectKey);
-            }
+        private void AttachTransportEvents(IMmoTransport transport)
+        {
+            transport.SetMessageQueue(_messageQueue);
+            transport.OnConnected += () => OnConnected?.Invoke();
+            transport.OnDisconnected += () => OnDisconnected?.Invoke();
+            transport.OnError += err => OnConnectionError?.Invoke(err);
+            transport.OnServerClosed += () => OnServerClosed?.Invoke();
         }
 
         public void DisconnectFromEdge()
