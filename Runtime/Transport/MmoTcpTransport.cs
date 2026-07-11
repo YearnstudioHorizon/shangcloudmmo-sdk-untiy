@@ -113,6 +113,7 @@ namespace ShangCloud.MMO.Transport
 
         private void ConnectAndReceive(string host, int port)
         {
+            string phase = "resolving host";
             try
             {
                 // Resolve the hostname ourselves and connect a raw Socket to an
@@ -120,15 +121,19 @@ namespace ShangCloud.MMO.Transport
                 // overload throws "Operation is not supported on this platform" on
                 // Unity/Mono; Socket.Connect(IPEndPoint) does not.
                 IPAddress target = ResolveHost(host);
+                phase = "connecting socket";
                 _socket = ConnectSocket(target, port);
 
                 // Step 1: Send 32-byte seed (plaintext)
+                phase = "starting crypto handshake";
                 byte[] seed = MmoCrypto.GenerateSeed();
                 _aesKey = MmoCrypto.DeriveKey(seed);
+                phase = "sending seed";
                 SendExact(seed, 0, seed.Length);
                 _state = MmoConnectionState.Handshake;
 
                 // Step 2: Send encrypted connect_key with length-prefix frame
+                phase = "encrypting connect_key";
                 byte[] keyBytes = Encoding.UTF8.GetBytes(_connectKey);
                 int encSize = MmoCrypto.GetEncryptedSize(keyBytes.Length);
                 byte[] encBuffer = ArrayPool<byte>.Shared.Rent(encSize);
@@ -144,13 +149,14 @@ namespace ShangCloud.MMO.Transport
                 _state = MmoConnectionState.Authenticating;
 
                 // Step 3: Enter receive loop
+                phase = "receiving data";
                 ReceiveLoop();
             }
             catch (Exception ex)
             {
                 if (_disposed || _state == MmoConnectionState.Disconnected) return;
                 _state = MmoConnectionState.Error;
-                RaiseError($"TCP connection error: {GetConnectionErrorMessage(ex)}");
+                RaiseError($"TCP {phase} error: {GetConnectionErrorMessage(ex)}");
                 RaiseDisconnected();
             }
         }
@@ -276,12 +282,12 @@ namespace ShangCloud.MMO.Transport
 
         private string GetConnectionErrorMessage(Exception ex)
         {
-            if (ex is PlatformNotSupportedException)
+            if (ex.InnerException != null)
             {
-                return "TCP sockets are not supported on this platform. Use a native platform build or a WebSocket transport implementation.";
+                return $"{DescribeException(ex)}; inner: {DescribeException(ex.InnerException)}";
             }
 
-            return ex.Message;
+            return DescribeException(ex);
         }
 
         private IPAddress ResolveHost(string host)
