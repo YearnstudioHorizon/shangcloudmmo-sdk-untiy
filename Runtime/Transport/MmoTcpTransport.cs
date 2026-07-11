@@ -6,6 +6,7 @@ using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 using ShangCloud.MMO.Crypto;
+using ShangCloud.MMO.Threading;
 #endif
 
 namespace ShangCloud.MMO.Transport
@@ -38,6 +39,7 @@ namespace ShangCloud.MMO.Transport
     public class MmoTcpTransport : MmoTransportBase
     {
         private Socket _socket;
+        private TcpClient _tcpClient;
         private Thread _recvThread;
         private readonly object _sendLock = new object();
 
@@ -59,7 +61,9 @@ namespace ShangCloud.MMO.Transport
         {
             _state = MmoConnectionState.Disconnected;
             var sock = _socket;
+            var client = _tcpClient;
             _socket = null;
+            _tcpClient = null;
             if (sock != null)
             {
                 // Signal graceful shutdown so any blocking Receive on the recv thread
@@ -67,6 +71,7 @@ namespace ShangCloud.MMO.Transport
                 try { sock.Shutdown(SocketShutdown.Both); } catch { }
                 try { sock.Close(); } catch { }
             }
+            try { client?.Close(); } catch { }
         }
 
         public override void Poll(float deltaTime)
@@ -103,6 +108,7 @@ namespace ShangCloud.MMO.Transport
         {
             base.Dispose();
             _socket = null;
+            _tcpClient = null;
         }
 
         private void ConnectAndReceive(string host, int port)
@@ -152,18 +158,74 @@ namespace ShangCloud.MMO.Transport
         private Socket ConnectSocket(IPAddress target, int port)
         {
             var endPoint = new IPEndPoint(target, port);
-            Socket sock = new Socket(target.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+            Exception syncConnectError = null;
+            Exception asyncConnectError = null;
+
+            try
+            {
+                return ConnectRawSocket(endPoint);
+            }
+            catch (Exception ex)
+            {
+                syncConnectError = ex;
+                if (!ShouldRetryWithAlternativeConnect(ex))
+                    throw;
+            }
+
+            try
+            {
+                return ConnectSocketAsync(endPoint);
+            }
+            catch (Exception ex)
+            {
+                asyncConnectError = ex;
+                if (!ShouldRetryWithAlternativeConnect(ex))
+                    throw;
+            }
+
+            try
+            {
+                return ConnectTcpClient(target, port);
+            }
+            catch (Exception tcpClientError)
+            {
+                throw new InvalidOperationException(
+                    "All TCP connect attempts failed. " +
+                    $"Socket.Connect: {DescribeException(syncConnectError)}; " +
+                    $"Socket.BeginConnect: {DescribeException(asyncConnectError)}; " +
+                    $"TcpClient.Connect: {DescribeException(tcpClientError)}",
+                    tcpClientError);
+            }
+        }
+
+        private Socket ConnectRawSocket(IPEndPoint endPoint)
+        {
+            Socket sock = new Socket(endPoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
             try
             {
                 sock.Connect(endPoint);
                 return sock;
             }
-            catch (Exception ex)
+            catch
             {
                 try { sock.Close(); } catch { }
-                if (ShouldRetryWithAsyncConnect(ex))
-                    return ConnectSocketAsync(endPoint);
+                throw;
+            }
+        }
 
+        private Socket ConnectTcpClient(IPAddress target, int port)
+        {
+            TcpClient client = new TcpClient(target.AddressFamily);
+            try
+            {
+                client.NoDelay = true;
+                client.Connect(target, port);
+                _tcpClient = client;
+                return client.Client;
+            }
+            catch
+            {
+                try { client.Close(); } catch { }
                 throw;
             }
         }
@@ -192,7 +254,7 @@ namespace ShangCloud.MMO.Transport
             }
         }
 
-        private bool ShouldRetryWithAsyncConnect(Exception ex)
+        private bool ShouldRetryWithAlternativeConnect(Exception ex)
         {
             var socketEx = ex as SocketException;
             if (socketEx != null)
@@ -204,25 +266,22 @@ namespace ShangCloud.MMO.Transport
             return ex is NotSupportedException || ex is PlatformNotSupportedException;
         }
 
+        private string DescribeException(Exception ex)
+        {
+            if (ex == null)
+                return "none";
+
+            return $"{ex.GetType().Name}: {ex.Message}";
+        }
+
         private string GetConnectionErrorMessage(Exception ex)
         {
-            if (IsPlatformNotSupported(ex))
+            if (ex is PlatformNotSupportedException)
             {
                 return "TCP sockets are not supported on this platform. Use a native platform build or a WebSocket transport implementation.";
             }
 
             return ex.Message;
-        }
-
-        private bool IsPlatformNotSupported(Exception ex)
-        {
-            if (ex is PlatformNotSupportedException || ex is NotSupportedException)
-                return true;
-
-            var socketEx = ex as SocketException;
-            return socketEx != null &&
-                   (socketEx.SocketErrorCode == SocketError.OperationNotSupported ||
-                    socketEx.ErrorCode == 10045);
         }
 
         private IPAddress ResolveHost(string host)
