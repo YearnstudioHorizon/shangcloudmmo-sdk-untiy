@@ -1,5 +1,6 @@
 using System;
 using System.Buffers;
+using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
@@ -10,8 +11,7 @@ namespace ShangCloud.MMO.Transport
 {
     public class MmoTcpTransport : MmoTransportBase
     {
-        private TcpClient _tcp;
-        private NetworkStream _stream;
+        private Socket _socket;
         private Thread _recvThread;
         private readonly object _sendLock = new object();
 
@@ -32,10 +32,15 @@ namespace ShangCloud.MMO.Transport
         public override void Disconnect()
         {
             _state = MmoConnectionState.Disconnected;
-            try { _stream?.Close(); } catch { }
-            try { _tcp?.Close(); } catch { }
-            _stream = null;
-            _tcp = null;
+            var sock = _socket;
+            _socket = null;
+            if (sock != null)
+            {
+                // Signal graceful shutdown so any blocking Receive on the recv thread
+                // unblocks immediately, then close.
+                try { sock.Shutdown(SocketShutdown.Both); } catch { }
+                try { sock.Close(); } catch { }
+            }
         }
 
         public override void Poll(float deltaTime)
@@ -71,22 +76,25 @@ namespace ShangCloud.MMO.Transport
         public override void Dispose()
         {
             base.Dispose();
-            _stream = null;
-            _tcp = null;
+            _socket = null;
         }
 
         private void ConnectAndReceive(string host, int port)
         {
             try
             {
-                _tcp = new TcpClient();
-                _tcp.Connect(host, port);
-                _stream = _tcp.GetStream();
+                // Resolve the hostname ourselves and connect a raw Socket to an
+                // already-resolved IPEndPoint. The TcpClient.Connect(string, int)
+                // overload throws "Operation is not supported on this platform" on
+                // Unity/Mono; Socket.Connect(IPEndPoint) does not.
+                IPAddress target = ResolveHost(host);
+                _socket = new Socket(target.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+                _socket.Connect(new IPEndPoint(target, port));
 
                 // Step 1: Send 32-byte seed (plaintext)
                 byte[] seed = MmoCrypto.GenerateSeed();
                 _aesKey = MmoCrypto.DeriveKey(seed);
-                _stream.Write(seed, 0, seed.Length);
+                SendExact(seed, 0, seed.Length);
                 _state = MmoConnectionState.Handshake;
 
                 // Step 2: Send encrypted connect_key with length-prefix frame
@@ -116,6 +124,25 @@ namespace ShangCloud.MMO.Transport
             }
         }
 
+        private IPAddress ResolveHost(string host)
+        {
+            // If it's already an IP literal, skip DNS entirely.
+            if (IPAddress.TryParse(host, out var literal))
+                return literal;
+
+            IPAddress[] addresses = Dns.GetHostAddresses(host);
+            if (addresses.Length == 0)
+                throw new SocketException((int)SocketError.HostNotFound);
+
+            // Prefer IPv4 (matches the working UDP path); fall back to first resolved.
+            for (int i = 0; i < addresses.Length; i++)
+            {
+                if (addresses[i].AddressFamily == AddressFamily.InterNetwork)
+                    return addresses[i];
+            }
+            return addresses[0];
+        }
+
         private void ReceiveLoop()
         {
             byte[] lenBuf = new byte[4];
@@ -139,7 +166,6 @@ namespace ShangCloud.MMO.Transport
                 {
                     if (!ReadExact(encPayload, 0, (int)payloadLen))
                     {
-                        ArrayPool<byte>.Shared.Return(encPayload);
                         break;
                     }
 
@@ -205,7 +231,7 @@ namespace ShangCloud.MMO.Transport
                 int read;
                 try
                 {
-                    read = _stream.Read(buffer, offset + totalRead, count - totalRead);
+                    read = _socket.Receive(buffer, offset + totalRead, count - totalRead, SocketFlags.None);
                 }
                 catch
                 {
@@ -227,8 +253,8 @@ namespace ShangCloud.MMO.Transport
             {
                 try
                 {
-                    _stream?.Write(header, 0, 4);
-                    _stream?.Write(payload, 0, length);
+                    SendExact(header, 0, 4);
+                    SendExact(payload, 0, length);
                 }
                 catch
                 {
@@ -238,6 +264,23 @@ namespace ShangCloud.MMO.Transport
                         RaiseError("TCP send failed");
                     }
                 }
+            }
+        }
+
+        // Loops until the full range has been sent. Socket.Send may return fewer
+        // bytes than requested, unlike NetworkStream.Write which handles this internally.
+        private void SendExact(byte[] buffer, int offset, int count)
+        {
+            var sock = _socket;
+            if (sock == null) return;
+
+            int totalSent = 0;
+            while (totalSent < count)
+            {
+                int sent = sock.Send(buffer, offset + totalSent, count - totalSent, SocketFlags.None);
+                if (sent <= 0)
+                    throw new SocketException((int)SocketError.Shutdown);
+                totalSent += sent;
             }
         }
     }
