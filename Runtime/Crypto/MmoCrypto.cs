@@ -125,7 +125,7 @@ namespace ShangCloud.MMO.Crypto
                 var ciphertext = outputBuffer.AsSpan(NonceSize, ptLen);
                 var tag = outputBuffer.AsSpan(NonceSize + ptLen, TagSize);
 
-                using var aes = new AesGcm(key, TagSize);
+                using var aes = new AesGcm(key);
                 aes.Encrypt(nonce, pt, ciphertext, tag);
             }
             finally
@@ -151,7 +151,7 @@ namespace ShangCloud.MMO.Crypto
             {
                 var pt = ptBuffer.AsSpan(0, ctLen);
 
-                using var aes = new AesGcm(key, TagSize);
+                using var aes = new AesGcm(key);
                 try
                 {
                     aes.Decrypt(nonce, ciphertext, tag, pt);

@@ -157,7 +157,7 @@ namespace ShangCloud.MMO
             _interpEngine.ClearUid(uid);
         }
 
-        public void SendMessage(string message)
+        public new void SendMessage(string message)
         {
             if (_transport == null || _transport.State != MmoConnectionState.Connected)
             {
