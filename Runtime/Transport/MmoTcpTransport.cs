@@ -41,6 +41,7 @@ namespace ShangCloud.MMO.Transport
         private Socket _socket;
         private TcpClient _tcpClient;
         private Thread _recvThread;
+        private Thread _heartbeatThread;
         private readonly object _sendLock = new object();
 
         public override void Connect(string host, int port, string connectKey)
@@ -55,6 +56,7 @@ namespace ShangCloud.MMO.Transport
                 Name = "MMO-TCP-Recv"
             };
             _recvThread.Start();
+            StartHeartbeatThread();
         }
 
         public override void Disconnect()
@@ -76,15 +78,8 @@ namespace ShangCloud.MMO.Transport
 
         public override void Poll(float deltaTime)
         {
-            if (_state == MmoConnectionState.Connected)
-            {
-                _heartbeatTimer += deltaTime;
-                if (_heartbeatTimer >= HeartbeatInterval)
-                {
-                    _heartbeatTimer = 0f;
-                    SendHeartbeat();
-                }
-            }
+            // TCP heartbeats are sent from a background thread so the server does
+            // not drop the connection when Unity Update is paused or not called.
         }
 
         public override void Send(byte[] data, int length)
@@ -386,6 +381,41 @@ namespace ShangCloud.MMO.Transport
             {
                 _state = MmoConnectionState.Disconnected;
                 RaiseDisconnected();
+            }
+        }
+
+        private void StartHeartbeatThread()
+        {
+            if (_heartbeatThread != null && _heartbeatThread.IsAlive)
+                return;
+
+            _heartbeatThread = new Thread(HeartbeatLoop)
+            {
+                IsBackground = true,
+                Name = "MMO-TCP-Heartbeat"
+            };
+            _heartbeatThread.Start();
+        }
+
+        private void HeartbeatLoop()
+        {
+            while (!_disposed &&
+                   _state != MmoConnectionState.Disconnected &&
+                   _state != MmoConnectionState.Error)
+            {
+                Thread.Sleep(TimeSpan.FromSeconds(HeartbeatInterval));
+
+                if (_disposed ||
+                    _state == MmoConnectionState.Disconnected ||
+                    _state == MmoConnectionState.Error)
+                {
+                    break;
+                }
+
+                if (_state == MmoConnectionState.Connected)
+                {
+                    SendHeartbeat();
+                }
             }
         }
 
