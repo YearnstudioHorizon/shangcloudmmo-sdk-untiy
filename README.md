@@ -118,9 +118,18 @@ mmo.ConnectToWebSocketEdge("wss://example.com/ws", "your_connect_key");
 
 ```csharp
 // 连接成功后发送加入消息（封装版，等价于手写 __join__ JSON）
+// 会自动把自己写入本地成员列表并发送 __ping__ 查询完整列表
 mmo.OnConnected += () =>
 {
     mmo.SendJoinAnnouncement("player1", "玩家一");
+};
+
+// 房间成员列表（参考 extension getMemberList）
+mmo.OnMembersUpdated += (userCount, members) =>
+{
+    Debug.Log($"房间人数={userCount} 成员数={members.Count}");
+    foreach (var m in mmo.GetMemberList())
+        Debug.Log($"  {m.Uid} | {m.Nickname}");
 };
 
 // 发送广播消息（封装版，wire：{"uid","message","extra"}，无 type 字段）
@@ -254,6 +263,7 @@ catch (ShangCloudApiException ex)
 | `OnSyncVarInterpolated` | `Action<string,string,double>` | 插帧引擎逐帧推进时触发 `(uid, varName, value)`，回写场景对象即可（移植自 core.js 的 `_ensureInterpLoop`） |
 | `OnUserJoined` | `Action<string, string>` | 用户加入房间，参数为 uid 和 nickname |
 | `OnUserLeft` | `Action<string>` | 用户离开房间，参数为 uid |
+| `OnMembersUpdated` | `Action<int, IReadOnlyList<MmoRoomMember>>` | 收到 `__pong__` 后成员列表更新 `(userCount, members)` |
 | `OnServerClosed` | `Action` | 服务端主动关闭连接 |
 
 ### 方法
@@ -270,7 +280,10 @@ catch (ShangCloudApiException ex)
 | `SendRaw(byte[], int)` | 发送二进制数据 |
 | `SendBroadcast(uid, message, extra)` | 封装广播，wire：`{"uid","message","extra"}` |
 | `SendSyncVar(uid, vars, interp)` | 封装同步变量，wire：`{"type":"__sync_var__","uid","vars","interp"}` |
-| `SendJoinAnnouncement(uid, nickname)` | 封装加入通知，wire：`{"type":"__join__","uid","nickname"}` |
+| `SendJoinAnnouncement(uid, nickname)` | 封装加入通知，wire：`{"type":"__join__","uid","nickname"}`；同时写入本地成员缓存并发送 `__ping__` |
+| `QueryMembers()` | 发送 `__ping__` 查询房间成员（服务端回 `__pong__:N:membersJSON`） |
+| `GetMemberList() -> IReadOnlyList<MmoRoomMember>` | 本地缓存的成员列表（参考扩展 getMemberList） |
+| `GetRoomUserCount() -> int` | 最近一次 `__pong__` 的房间人数 |
 | `GetSyncVar(uid, varName) -> double` | 读取插帧变量平滑后的当前值（移植自 core.js 的插帧引擎） |
 | `GetSyncVarRaw(uid, varName) -> string` | 读取同步变量原始值（不做插帧） |
 | `ClearSyncVarState(uid)` | 清理指定 uid 的插帧状态（玩家离开时调用） |

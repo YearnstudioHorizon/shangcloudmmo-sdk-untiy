@@ -8,6 +8,13 @@ using ShangCloud.MMO.Transport;
 
 namespace ShangCloud.MMO
 {
+    /// <summary>房间成员信息（参考 extension getMemberList / __pong__ 成员 JSON）。</summary>
+    public sealed class MmoRoomMember
+    {
+        public string Uid { get; set; } = string.Empty;
+        public string Nickname { get; set; } = string.Empty;
+    }
+
     public class ShangCloudMMO : MonoBehaviour
     {
         [SerializeField] private MmoProtocol protocol = MmoProtocol.TCP;
@@ -46,11 +53,21 @@ namespace ShangCloud.MMO
         /// </summary>
         public event Action<string, string, double> OnSyncVarInterpolated;
 
+        /// <summary>
+        /// 房间成员列表更新（收到 __pong__ 后触发）。参数：(userCount, members)。
+        /// 参考 extension getMemberList / window._mmoMembers。
+        /// </summary>
+        public event Action<int, IReadOnlyList<MmoRoomMember>> OnMembersUpdated;
+
         private IMmoTransport _transport;
         private readonly MmoMessageQueue _messageQueue = new MmoMessageQueue();
 
         // 插帧引擎（移植自 core.js 的 _ensureInterpLoop / _mmoInterpState）
         private readonly MmoInterpEngine _interpEngine = new MmoInterpEngine();
+
+        // 房间成员缓存（参考 extension 的 window._mmoMembers）
+        private readonly List<MmoRoomMember> _members = new List<MmoRoomMember>();
+        private int _roomUserCount;
 
         /// <summary>
         /// Configures this component from an API response.
@@ -197,7 +214,11 @@ namespace ShangCloud.MMO
         {
             transport.SetMessageQueue(_messageQueue);
             transport.OnConnected += () => OnConnected?.Invoke();
-            transport.OnDisconnected += () => OnDisconnected?.Invoke();
+            transport.OnDisconnected += () =>
+            {
+                ClearMembers();
+                OnDisconnected?.Invoke();
+            };
             transport.OnError += err => OnConnectionError?.Invoke(err);
             transport.OnServerClosed += () => OnServerClosed?.Invoke();
         }
@@ -206,6 +227,7 @@ namespace ShangCloud.MMO
         {
             _transport?.Disconnect();
             _interpEngine.Clear();
+            ClearMembers();
         }
 
         /// <summary>
@@ -321,6 +343,40 @@ namespace ShangCloud.MMO
                 ["nickname"] = nickname ?? string.Empty,
             };
             SendMessage(payload.ToString(Newtonsoft.Json.Formatting.None));
+
+            // 立即将自己加入本地成员列表（参考 extension wasm，无需等待 __pong__）
+            UpsertMember(uid ?? string.Empty, nickname ?? string.Empty);
+            // 主动查询完整成员列表
+            QueryMembers();
+        }
+
+        /// <summary>
+        /// 查询房间成员列表。发送 __ping__，服务端以 __pong__:N:membersJSON 响应并更新本地缓存。
+        /// 结果通过 <see cref="OnMembersUpdated"/> 与 <see cref="GetMemberList"/> 获取。
+        /// </summary>
+        public void QueryMembers()
+        {
+            if (_transport == null || _transport.State != MmoConnectionState.Connected)
+            {
+                Debug.LogError("ShangCloudMMO: cannot query members, not connected");
+                return;
+            }
+            SendMessage("__ping__");
+        }
+
+        /// <summary>
+        /// 返回本地缓存的房间成员列表（参考 extension getMemberList）。
+        /// 由 __join__/__leave__/__pong__ 维护。
+        /// </summary>
+        public IReadOnlyList<MmoRoomMember> GetMemberList()
+        {
+            return _members.ToArray();
+        }
+
+        /// <summary>返回最近一次 __pong__ 的房间人数（无缓存时为成员列表长度）。</summary>
+        public int GetRoomUserCount()
+        {
+            return _roomUserCount > 0 ? _roomUserCount : _members.Count;
         }
 
         private void Update()
@@ -381,8 +437,88 @@ namespace ShangCloud.MMO
             }
         }
 
+        private void ClearMembers()
+        {
+            _members.Clear();
+            _roomUserCount = 0;
+        }
+
+        private void UpsertMember(string uid, string nickname)
+        {
+            if (string.IsNullOrEmpty(uid)) return;
+            for (int i = 0; i < _members.Count; i++)
+            {
+                if (_members[i].Uid == uid)
+                {
+                    _members[i].Nickname = nickname ?? string.Empty;
+                    return;
+                }
+            }
+            _members.Add(new MmoRoomMember
+            {
+                Uid = uid,
+                Nickname = nickname ?? string.Empty,
+            });
+        }
+
+        private void RemoveMember(string uid)
+        {
+            _members.RemoveAll(m => m.Uid == uid);
+        }
+
+        private void ApplyMembersFromPong(string membersJson, int count)
+        {
+            if (!string.IsNullOrEmpty(membersJson) && membersJson != "null")
+            {
+                try
+                {
+                    var arr = JArray.Parse(membersJson);
+                    var next = new List<MmoRoomMember>(arr.Count);
+                    for (int i = 0; i < arr.Count; i++)
+                    {
+                        var item = arr[i] as JObject;
+                        if (item == null) continue;
+                        string uid = item.Value<string>("uid") ?? string.Empty;
+                        if (string.IsNullOrEmpty(uid)) continue;
+                        next.Add(new MmoRoomMember
+                        {
+                            Uid = uid,
+                            Nickname = item.Value<string>("nickname") ?? string.Empty,
+                        });
+                    }
+                    _members.Clear();
+                    _members.AddRange(next);
+                }
+                catch
+                {
+                    // 成员 JSON 解析失败时保留现有缓存
+                }
+            }
+            _roomUserCount = count > 0 ? count : _members.Count;
+            OnMembersUpdated?.Invoke(_roomUserCount, _members.ToArray());
+        }
+
         private void ProcessBusinessMessage(string message)
         {
+            // __pong__:<人数>:<成员JSON> —— 房间成员查询响应（参考 extension wasm）
+            if (message.StartsWith("__pong__", StringComparison.Ordinal))
+            {
+                string rest = message.Length > 8 ? message.Substring(8) : string.Empty;
+                if (rest.StartsWith(":", StringComparison.Ordinal))
+                    rest = rest.Substring(1);
+                string countStr = rest;
+                string membersJson = string.Empty;
+                int colonIdx = rest.IndexOf(':');
+                if (colonIdx >= 0)
+                {
+                    countStr = rest.Substring(0, colonIdx);
+                    membersJson = rest.Substring(colonIdx + 1);
+                }
+                int.TryParse(countStr, out int count);
+                ApplyMembersFromPong(membersJson, count);
+                return;
+            }
+
             if (message.Length > 0 && message[0] == '{')
             {
                 try
@@ -394,6 +530,7 @@ namespace ShangCloud.MMO
                     {
                         string uid = json.Value<string>("uid") ?? "";
                         string nickname = json.Value<string>("nickname") ?? "";
+                        UpsertMember(uid, nickname);
                         OnUserJoined?.Invoke(uid, nickname);
                         return;
                     }
@@ -401,6 +538,7 @@ namespace ShangCloud.MMO
                     if (type == "__leave__")
                     {
                         string uid = json.Value<string>("uid") ?? "";
+                        RemoveMember(uid);
                         _interpEngine.ClearUid(uid);
                         OnUserLeft?.Invoke(uid);
                         return;
