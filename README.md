@@ -185,38 +185,92 @@ api.AccessToken = "your_token";
 api.TokenType = "Bearer";
 ```
 
-### 房间管理
+### 设备授权登录（Device Auth + PKCE，免 Secret）
+
+适用于游戏客户端等无法安全保存 `client_secret` 的场景。需在开发者中心开启应用的 **「允许公开客户端 PKCE」**。
+
+流程：申请设备码 → 用户在浏览器输入 `user_code` 并授权 → SDK 轮询拿到 `access_token`（自动写入 `api.AccessToken`）。
 
 ```csharp
-// 创建房间，protocol 可选 "tcp" / "websocket"
-MmoNewRoomResponse room = await api.NewRoomAsync("tcp");
+var api = new ShangCloudApiClient("https://api.yearnstudio.cn");
+api.ClientId = "your_client_id";
 
-// 加入房间
-MmoJoinRoomResponse joined = await api.JoinRoomAsync(roomId, "tcp");
+// 一键登录：展示验证码后自动轮询
+var token = await api.LoginWithDeviceAuthAsync(
+    clientId: "your_client_id",
+    scope: "openid profile mmo",
+    onUserCode: (userCode, uri, uriComplete) =>
+    {
+        Debug.Log($"请在浏览器打开: {uriComplete}");
+        Debug.Log($"或访问 {uri} 并输入: {userCode}");
+        Application.OpenURL(uriComplete);
+    });
 
-// 设置房间配置（仅房主）
-await api.SetRoomConfigAsync(roomId, allowMultiLogin: false);
+// 成功后 AccessToken / RefreshToken 已写入 api
+Debug.Log($"登录成功, expires_in={token.ExpiresIn}");
 
-// 踢出用户（仅房主，不能踢自己）
-await api.KickUserAsync(roomId, targetUid: "12345");
-
-// 查询房间人数
-int count = await api.GetRoomUserCountAsync(roomId);
+// 刷新令牌（公开客户端，仅 client_id）
+await api.RefreshAccessTokenAsync();
 ```
 
-### 房间数据（键值存储）
+也可拆分调用：`RequestDeviceAuthorizationAsync` + 自行轮询 `PollDeviceTokenOnceAsync`。
+
+文档：https://doc.yearnstudio.cn/doc-9232484
+
+### MMO 房间 OpenAPI（完整）
+
+鉴权：`Authorization: {TokenType} {AccessToken}`，token 须含 `mmo` scope。  
+协议头：`X-MMO-Protoctl`（`tcp` / `websocket`，拼写与官方一致）。  
+房间头：`X-MMO-Room`（除创建房间外必填）。
+
+| 方法 | 路径 | SDK | 说明 |
+|------|------|-----|------|
+| POST | `/api/mmo/room/new` | `NewRoomAsync` | 创建房间，调用者成为房主 |
+| POST | `/api/mmo/room/join` | `JoinRoomAsync` | 加入房间，每次独立 `connect_key` |
+| POST | `/api/mmo/room/data/set` | `SetRoomDataAsync` | 设置额外数据（仅房主） |
+| POST | `/api/mmo/room/data/get` | `GetRoomDataAsync` | 获取全部额外数据 |
+| POST | `/api/mmo/room/data/delete` | `DeleteRoomDataAsync` | 删除指定键（仅房主） |
+| POST | `/api/mmo/room/kick` | `KickUserAsync` | 踢人（仅房主，不能踢自己） |
+| POST | `/api/mmo/room/usercount` | `GetRoomUserCountAsync` | 查询当前人数 |
+
+文档：
+- 创建：https://doc.yearnstudio.cn/api-475695436  
+- 加入：https://doc.yearnstudio.cn/api-475695437  
+- 设数据：https://doc.yearnstudio.cn/api-475695439  
+- 取数据：https://doc.yearnstudio.cn/api-475695440  
+- 删数据：https://doc.yearnstudio.cn/api-475695441  
+- 踢人：https://doc.yearnstudio.cn/api-475695442  
+- 人数：https://doc.yearnstudio.cn/api-475695443  
 
 ```csharp
-// 设置数据（仅房主），type 可选 "number" / "string" / "boolean"
-await api.SetRoomDataAsync(roomId, "score", 100, "number");
-await api.SetRoomDataAsync(roomId, "is_started", true, "boolean");
+// 1) 创建房间 → connect_key + edge_url + room_id + protocol
+MmoNewRoomResponse room = await api.NewRoomAsync("tcp"); // 或 "websocket"
+Debug.Log($"room={room.RoomId} edge={room.EdgeUrl}");
 
-// 获取所有数据
+// 2) 加入已有房间（一号多登时可能返回 AssignedUid）
+MmoJoinRoomResponse joined = await api.JoinRoomAsync(roomId, "websocket");
+if (!string.IsNullOrEmpty(joined.AssignedUid))
+    Debug.Log($"临时 UID: {joined.AssignedUid}");
+
+// 3) 房间额外数据（仅房主可写/删）
+// type: "number" / "string" / "boolean"，默认 string
+await api.SetRoomDataAsync(roomId, "max_players", "8", "number");
+await api.SetRoomDataAsync(roomId, "is_started", "true", "boolean");
 Dictionary<string, object> data = await api.GetRoomDataAsync(roomId);
+await api.DeleteRoomDataAsync(roomId, "max_players");
 
-// 删除数据（仅房主）
-await api.DeleteRoomDataAsync(roomId, "score");
+// 4) 踢人（仅房主）
+await api.KickUserAsync(roomId, "12345");
+
+// 5) 查询人数（仅同应用房间）
+int count = await api.GetRoomUserCountAsync(roomId);
+
+// 6) 用 API 结果连边缘节点
+mmo.ConfigureFromApiResponse(room.ConnectKey, room.EdgeUrl, room.Protocol);
+mmo.ConnectToEdge();
 ```
+
+另有 `SetRoomConfigAsync(roomId, allowMultiLogin)` → `POST /api/mmo/room/config`（房间配置）。
 
 ### 错误处理
 
@@ -228,10 +282,7 @@ try
 catch (ShangCloudApiException ex)
 {
     Debug.LogError($"HTTP {ex.StatusCode}: {ex.ResponseBody}");
-    // 400 = 参数无效
-    // 401 = token 无效
-    // 403 = 权限不足
-    // 404 = 房间不存在
+    // 400 参数无效 | 401 token 无效 | 403 无 mmo/非房主/跨应用 | 404 房间不存在
 }
 ```
 

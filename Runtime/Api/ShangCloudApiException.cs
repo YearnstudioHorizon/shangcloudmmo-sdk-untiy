@@ -14,6 +14,11 @@ namespace ShangCloud.MMO.Api
             ResponseBody = responseBody;
         }
 
+        public ShangCloudApiException(string message)
+            : base(message)
+        {
+        }
+
         public ShangCloudApiException(string message, Exception innerException)
             : base(message, innerException)
         {

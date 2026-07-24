@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
 using System.Net.Http;
+using System.Security.Cryptography;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using Newtonsoft.Json;
 
@@ -9,11 +11,16 @@ namespace ShangCloud.MMO.Api
 {
     public class ShangCloudApiClient : IDisposable
     {
+        private const string DeviceCodeGrantType = "urn:ietf:params:oauth:grant-type:device_code";
+        private const string DefaultDeviceScope = "openid profile mmo";
+
         private readonly string _baseUrl;
         private readonly HttpClient _httpClient;
 
         public string AccessToken { get; set; }
         public string TokenType { get; set; } = "Bearer";
+        public string RefreshToken { get; set; }
+        public string ClientId { get; set; }
 
         public ShangCloudApiClient(string baseUrl = "https://api.yearnstudio.cn")
         {
@@ -95,9 +102,230 @@ namespace ShangCloud.MMO.Api
             return resp?.UserCount ?? 0;
         }
 
+        /// <summary>
+        /// Starts device authorization (RFC 8628) as a public client with PKCE S256 (no client_secret).
+        /// Requires the app to enable "allow public PKCE" in the developer console.
+        /// </summary>
+        /// <param name="clientId">OAuth client_id</param>
+        /// <param name="scope">Space-separated scopes; default includes mmo</param>
+        /// <returns>Device codes and verification URIs; keep DeviceCode server-side only</returns>
+        public async Task<(DeviceAuthorizationResponse Response, string CodeVerifier)> RequestDeviceAuthorizationAsync(
+            string clientId = null, string scope = null)
+        {
+            clientId = clientId ?? ClientId;
+            if (string.IsNullOrEmpty(clientId))
+                throw new ArgumentException("client_id is required", nameof(clientId));
+
+            string codeVerifier;
+            string codeChallenge;
+            MakePkce(out codeVerifier, out codeChallenge);
+
+            var form = new Dictionary<string, string>
+            {
+                { "client_id", clientId },
+                { "scope", string.IsNullOrEmpty(scope) ? DefaultDeviceScope : scope },
+                { "code_challenge", codeChallenge },
+                { "code_challenge_method", "S256" },
+            };
+
+            string body = await FormPostAsync("/oauth/device_authorization", form, throwOnError: true);
+            var response = JsonConvert.DeserializeObject<DeviceAuthorizationResponse>(body);
+            if (response == null || string.IsNullOrEmpty(response.DeviceCode))
+                throw new ShangCloudApiException("Invalid device_authorization response");
+
+            if (response.Interval <= 0) response.Interval = 5;
+            if (response.ExpiresIn <= 0) response.ExpiresIn = 900;
+
+            ClientId = clientId;
+            return (response, codeVerifier);
+        }
+
+        /// <summary>
+        /// Polls the token endpoint once for a device_code grant (with PKCE code_verifier).
+        /// Returns null while authorization is still pending.
+        /// </summary>
+        public async Task<OAuthTokenResponse> PollDeviceTokenOnceAsync(
+            string deviceCode, string codeVerifier, string clientId = null)
+        {
+            clientId = clientId ?? ClientId;
+            if (string.IsNullOrEmpty(clientId))
+                throw new ArgumentException("client_id is required", nameof(clientId));
+            if (string.IsNullOrEmpty(deviceCode))
+                throw new ArgumentException("device_code is required", nameof(deviceCode));
+            if (string.IsNullOrEmpty(codeVerifier))
+                throw new ArgumentException("code_verifier is required", nameof(codeVerifier));
+
+            var form = new Dictionary<string, string>
+            {
+                { "grant_type", DeviceCodeGrantType },
+                { "device_code", deviceCode },
+                { "client_id", clientId },
+                { "code_verifier", codeVerifier },
+            };
+
+            var (status, body) = await FormPostRawAsync("/oauth/token", form);
+            if (status >= 200 && status < 300)
+            {
+                var token = JsonConvert.DeserializeObject<OAuthTokenResponse>(body);
+                if (token == null || string.IsNullOrEmpty(token.AccessToken))
+                    throw new ShangCloudApiException(status, body);
+                ApplyTokenResponse(token);
+                return token;
+            }
+
+            var err = JsonConvert.DeserializeObject<OAuthErrorResponse>(body);
+            string error = err?.Error ?? "";
+            if (error == "authorization_pending" || error == "slow_down")
+                return null;
+
+            throw new ShangCloudApiException(status, body);
+        }
+
+        /// <summary>
+        /// Full device login: request codes, notify UI via onUserCode, poll until token / timeout / cancel.
+        /// Public client + PKCE, no client_secret.
+        /// </summary>
+        /// <param name="onUserCode">Called with (userCode, verificationUri, verificationUriComplete)</param>
+        /// <param name="onPending">Optional; called on each authorization_pending poll</param>
+        public async Task<OAuthTokenResponse> LoginWithDeviceAuthAsync(
+            string clientId = null,
+            string scope = null,
+            Action<string, string, string> onUserCode = null,
+            Action onPending = null,
+            CancellationToken cancellationToken = default)
+        {
+            var (da, codeVerifier) = await RequestDeviceAuthorizationAsync(clientId, scope);
+            onUserCode?.Invoke(da.UserCode, da.VerificationUri, da.VerificationUriComplete);
+
+            int interval = da.Interval > 0 ? da.Interval : 5;
+            DateTime deadline = DateTime.UtcNow.AddSeconds(da.ExpiresIn > 0 ? da.ExpiresIn : 900);
+
+            while (DateTime.UtcNow < deadline)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                await Task.Delay(TimeSpan.FromSeconds(interval), cancellationToken);
+
+                var form = new Dictionary<string, string>
+                {
+                    { "grant_type", DeviceCodeGrantType },
+                    { "device_code", da.DeviceCode },
+                    { "client_id", clientId ?? ClientId },
+                    { "code_verifier", codeVerifier },
+                };
+
+                var (status, body) = await FormPostRawAsync("/oauth/token", form);
+                if (status >= 200 && status < 300)
+                {
+                    var token = JsonConvert.DeserializeObject<OAuthTokenResponse>(body);
+                    if (token == null || string.IsNullOrEmpty(token.AccessToken))
+                        throw new ShangCloudApiException(status, body);
+                    ApplyTokenResponse(token);
+                    return token;
+                }
+
+                var err = JsonConvert.DeserializeObject<OAuthErrorResponse>(body);
+                string error = err?.Error ?? "";
+                if (error == "authorization_pending")
+                {
+                    onPending?.Invoke();
+                    continue;
+                }
+                if (error == "slow_down")
+                {
+                    interval += 5;
+                    continue;
+                }
+
+                throw new ShangCloudApiException(status, body);
+            }
+
+            throw new ShangCloudApiException("Device authorization timed out (device_code expired)");
+        }
+
+        /// <summary>
+        /// Refreshes access_token using refresh_token as a public client (client_id only, no secret).
+        /// </summary>
+        public async Task<OAuthTokenResponse> RefreshAccessTokenAsync(
+            string refreshToken = null, string clientId = null)
+        {
+            clientId = clientId ?? ClientId;
+            refreshToken = refreshToken ?? RefreshToken;
+            if (string.IsNullOrEmpty(clientId))
+                throw new ArgumentException("client_id is required", nameof(clientId));
+            if (string.IsNullOrEmpty(refreshToken))
+                throw new ArgumentException("refresh_token is required", nameof(refreshToken));
+
+            var form = new Dictionary<string, string>
+            {
+                { "grant_type", "refresh_token" },
+                { "refresh_token", refreshToken },
+                { "client_id", clientId },
+            };
+
+            string body = await FormPostAsync("/oauth/token", form, throwOnError: true);
+            var token = JsonConvert.DeserializeObject<OAuthTokenResponse>(body);
+            if (token == null || string.IsNullOrEmpty(token.AccessToken))
+                throw new ShangCloudApiException("Invalid refresh_token response");
+            if (string.IsNullOrEmpty(token.RefreshToken))
+                token.RefreshToken = refreshToken;
+            ApplyTokenResponse(token);
+            return token;
+        }
+
         public void Dispose()
         {
             _httpClient?.Dispose();
+        }
+
+        private void ApplyTokenResponse(OAuthTokenResponse token)
+        {
+            AccessToken = token.AccessToken;
+            if (!string.IsNullOrEmpty(token.TokenType))
+                TokenType = token.TokenType;
+            if (!string.IsNullOrEmpty(token.RefreshToken))
+                RefreshToken = token.RefreshToken;
+        }
+
+        internal static void MakePkce(out string codeVerifier, out string codeChallenge)
+        {
+            var bytes = new byte[32];
+            using (var rng = RandomNumberGenerator.Create())
+            {
+                rng.GetBytes(bytes);
+            }
+
+            codeVerifier = Base64UrlEncode(bytes);
+            using (var sha = SHA256.Create())
+            {
+                byte[] hash = sha.ComputeHash(Encoding.ASCII.GetBytes(codeVerifier));
+                codeChallenge = Base64UrlEncode(hash);
+            }
+        }
+
+        private static string Base64UrlEncode(byte[] data)
+        {
+            return Convert.ToBase64String(data).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+        }
+
+        private async Task<string> FormPostAsync(string path, Dictionary<string, string> form, bool throwOnError)
+        {
+            var (status, body) = await FormPostRawAsync(path, form);
+            if (throwOnError && (status < 200 || status >= 300))
+                throw new ShangCloudApiException(status, body);
+            return body;
+        }
+
+        private async Task<(int Status, string Body)> FormPostRawAsync(string path, Dictionary<string, string> form)
+        {
+            var url = _baseUrl + path;
+            var request = new HttpRequestMessage(HttpMethod.Post, url)
+            {
+                Content = new FormUrlEncodedContent(form)
+            };
+
+            HttpResponseMessage response = await _httpClient.SendAsync(request);
+            string responseBody = await response.Content.ReadAsStringAsync();
+            return ((int)response.StatusCode, responseBody);
         }
 
         private async Task<string> PostAsync(string path, string jsonBody,

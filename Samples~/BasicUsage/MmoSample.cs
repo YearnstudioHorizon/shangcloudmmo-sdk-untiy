@@ -4,10 +4,10 @@ using ShangCloud.MMO.Api;
 
 /// <summary>
 /// Example showing the full API -> Transport flow:
-/// 1. Create or join a room via ShangCloudApiClient
-/// 2. Configure ShangCloudMMO from the API response
-/// 3. Connect to the edge node
-/// 4. Send/receive messages
+/// 1. Optional: device auth login (PKCE public client, no secret)
+/// 2. Create or join a room via ShangCloudApiClient
+/// 3. Configure ShangCloudMMO from the API response
+/// 4. Connect to the edge node
 /// </summary>
 public class MmoSample : MonoBehaviour
 {
@@ -15,6 +15,9 @@ public class MmoSample : MonoBehaviour
     [SerializeField] private string accessToken = "your_access_token";
     [SerializeField] private string tokenType = "Bearer";
     [SerializeField] private string baseUrl = "https://api.yearnstudio.cn";
+    [Tooltip("If set, login via device auth + PKCE (no client_secret) before room API")]
+    [SerializeField] private string clientId;
+    [SerializeField] private string deviceAuthScope = "openid profile mmo";
 
     [Header("Room")]
     [SerializeField] private string roomIdToJoin;
@@ -35,6 +38,7 @@ public class MmoSample : MonoBehaviour
         _api = new ShangCloudApiClient(baseUrl);
         _api.AccessToken = accessToken;
         _api.TokenType = tokenType;
+        _api.ClientId = clientId;
 
         // Subscribe to events
         mmo.OnConnected += OnConnected;
@@ -47,6 +51,18 @@ public class MmoSample : MonoBehaviour
 
         try
         {
+            if (!string.IsNullOrEmpty(clientId) && string.IsNullOrEmpty(accessToken))
+            {
+                await _api.LoginWithDeviceAuthAsync(clientId, deviceAuthScope,
+                    (userCode, uri, uriComplete) =>
+                    {
+                        Debug.Log($"[MMO] Open browser: {uriComplete}");
+                        Debug.Log($"[MMO] Or visit {uri} and enter: {userCode}");
+                        Application.OpenURL(uriComplete);
+                    });
+                Debug.Log("[MMO] Device auth login success");
+            }
+
             if (string.IsNullOrEmpty(roomIdToJoin))
             {
                 // Create a new room
