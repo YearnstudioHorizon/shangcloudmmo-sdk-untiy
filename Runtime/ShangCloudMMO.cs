@@ -69,6 +69,11 @@ namespace ShangCloud.MMO
         private readonly List<MmoRoomMember> _members = new List<MmoRoomMember>();
         private int _roomUserCount;
 
+        // 本端发送侧缺省变量缓存：未在本次 SendSyncVar 中出现的键自动沿用上次值
+        private string _outgoingSyncUid = string.Empty;
+        private readonly Dictionary<string, string> _outgoingSyncVars = new Dictionary<string, string>();
+        private readonly HashSet<string> _outgoingSyncInterp = new HashSet<string>();
+
         // 传输层事件在后台线程触发，入队后在主线程 Update 派发（可安全改 UI）
         private readonly Queue<PendingTransportEvent> _pendingEvents = new Queue<PendingTransportEvent>();
         private readonly object _pendingEventsLock = new object();
@@ -264,6 +269,7 @@ namespace ShangCloud.MMO
                         break;
                     case PendingEventKind.Disconnected:
                         ClearMembers();
+                        ClearOutgoingSyncVarCache();
                         OnDisconnected?.Invoke();
                         break;
                     case PendingEventKind.Error:
@@ -280,7 +286,16 @@ namespace ShangCloud.MMO
         {
             _transport?.Disconnect();
             _interpEngine.Clear();
+            ClearOutgoingSyncVarCache();
             ClearMembers();
+        }
+
+        /// <summary>清空本端发送侧缺省变量缓存（断开连接时会自动调用）。</summary>
+        public void ClearOutgoingSyncVarCache()
+        {
+            _outgoingSyncUid = string.Empty;
+            _outgoingSyncVars.Clear();
+            _outgoingSyncInterp.Clear();
         }
 
         /// <summary>
@@ -345,41 +360,65 @@ namespace ShangCloud.MMO
         /// <summary>
         /// 发送同步变量。wire 格式（参考 core.js 的 __sync_var__）：
         /// {"type":"__sync_var__","uid":"...","vars":{...},"interp":["x",...]}
+        /// 缺省变量处理：SDK 缓存本端最近一次完整 vars/interp，本次未传入的键自动补发上次值。
         /// </summary>
         /// <param name="uid">发送方 UID。</param>
         /// <param name="vars">变量名→值（值会被转为字符串，与 core.js 一致）。</param>
         /// <param name="interp">需要接收端插帧平滑的变量名列表。</param>
         public void SendSyncVar(string uid, IDictionary<string, object> vars, IReadOnlyList<string> interp = null)
         {
-            var varsObj = new JObject();
+            uid ??= string.Empty;
+            if (!string.Equals(uid, _outgoingSyncUid, StringComparison.Ordinal))
+            {
+                _outgoingSyncUid = uid;
+                _outgoingSyncVars.Clear();
+                _outgoingSyncInterp.Clear();
+            }
+
             if (vars != null)
             {
                 foreach (var kv in vars)
                 {
+                    if (kv.Key == null) continue;
                     // core.js 将所有值以字符串形式序列化
-                    varsObj[kv.Key] = kv.Value switch
+                    string value = kv.Value switch
                     {
                         null => string.Empty,
                         bool b => b ? "true" : "false",
                         IFormattable f => f.ToString(null, System.Globalization.CultureInfo.InvariantCulture),
                         _ => kv.Value.ToString(),
                     };
+                    _outgoingSyncVars[kv.Key] = value ?? string.Empty;
                 }
             }
 
-            var interpArr = new JArray();
             if (interp != null)
             {
                 foreach (var name in interp)
                 {
-                    interpArr.Add(name ?? string.Empty);
+                    if (!string.IsNullOrEmpty(name))
+                    {
+                        _outgoingSyncInterp.Add(name);
+                    }
                 }
+            }
+
+            var varsObj = new JObject();
+            foreach (var kv in _outgoingSyncVars)
+            {
+                varsObj[kv.Key] = kv.Value;
+            }
+
+            var interpArr = new JArray();
+            foreach (var name in _outgoingSyncInterp)
+            {
+                interpArr.Add(name);
             }
 
             var payload = new JObject
             {
                 ["type"] = "__sync_var__",
-                ["uid"] = uid ?? string.Empty,
+                ["uid"] = uid,
                 ["vars"] = varsObj,
                 ["interp"] = interpArr,
             };
