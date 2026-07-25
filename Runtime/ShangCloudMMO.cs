@@ -69,6 +69,24 @@ namespace ShangCloud.MMO
         private readonly List<MmoRoomMember> _members = new List<MmoRoomMember>();
         private int _roomUserCount;
 
+        // 传输层事件在后台线程触发，入队后在主线程 Update 派发（可安全改 UI）
+        private readonly Queue<PendingTransportEvent> _pendingEvents = new Queue<PendingTransportEvent>();
+        private readonly object _pendingEventsLock = new object();
+
+        private enum PendingEventKind
+        {
+            Connected,
+            Disconnected,
+            Error,
+            ServerClosed,
+        }
+
+        private struct PendingTransportEvent
+        {
+            public PendingEventKind Kind;
+            public string Error;
+        }
+
         /// <summary>
         /// Configures this component from an API response.
         /// Parses edgeUrl into host+port for TCP/UDP, or stores full URI for WebSocket.
@@ -213,14 +231,49 @@ namespace ShangCloud.MMO
         private void AttachTransportEvents(IMmoTransport transport)
         {
             transport.SetMessageQueue(_messageQueue);
-            transport.OnConnected += () => OnConnected?.Invoke();
-            transport.OnDisconnected += () =>
+            // 后台线程只入队，主线程 Update 再触发 C# 事件
+            transport.OnConnected += () => EnqueueTransportEvent(PendingEventKind.Connected, null);
+            transport.OnDisconnected += () => EnqueueTransportEvent(PendingEventKind.Disconnected, null);
+            transport.OnError += err => EnqueueTransportEvent(PendingEventKind.Error, err);
+            transport.OnServerClosed += () => EnqueueTransportEvent(PendingEventKind.ServerClosed, null);
+        }
+
+        private void EnqueueTransportEvent(PendingEventKind kind, string error)
+        {
+            lock (_pendingEventsLock)
             {
-                ClearMembers();
-                OnDisconnected?.Invoke();
-            };
-            transport.OnError += err => OnConnectionError?.Invoke(err);
-            transport.OnServerClosed += () => OnServerClosed?.Invoke();
+                _pendingEvents.Enqueue(new PendingTransportEvent { Kind = kind, Error = error });
+            }
+        }
+
+        private void DrainTransportEvents()
+        {
+            while (true)
+            {
+                PendingTransportEvent ev;
+                lock (_pendingEventsLock)
+                {
+                    if (_pendingEvents.Count == 0) return;
+                    ev = _pendingEvents.Dequeue();
+                }
+
+                switch (ev.Kind)
+                {
+                    case PendingEventKind.Connected:
+                        OnConnected?.Invoke();
+                        break;
+                    case PendingEventKind.Disconnected:
+                        ClearMembers();
+                        OnDisconnected?.Invoke();
+                        break;
+                    case PendingEventKind.Error:
+                        OnConnectionError?.Invoke(ev.Error);
+                        break;
+                    case PendingEventKind.ServerClosed:
+                        OnServerClosed?.Invoke();
+                        break;
+                }
+            }
         }
 
         public void DisconnectFromEdge()
@@ -381,6 +434,9 @@ namespace ShangCloud.MMO
 
         private void Update()
         {
+            // 先派发传输层事件（Connected/Error 等），保证回调在主线程
+            DrainTransportEvents();
+
             // 先推进插帧引擎（收到 sync_var 后逐帧把 current → target）
             if (_transport != null)
             {

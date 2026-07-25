@@ -1,11 +1,13 @@
 using System;
 using System.Collections.Generic;
 using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 
 namespace ShangCloud.MMO.Api
 {
@@ -25,7 +27,18 @@ namespace ShangCloud.MMO.Api
         public ShangCloudApiClient(string baseUrl = "https://api.yearnstudio.cn")
         {
             _baseUrl = baseUrl.TrimEnd('/');
-            _httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
+            _httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
+            // 避免部分服务端对 Expect: 100-continue 处理异常
+            _httpClient.DefaultRequestHeaders.ExpectContinue = false;
+        }
+
+        /// <summary>
+        /// 用当前 AccessToken 调用 GET /oauth/userinfo，用于确认 token 是否被 OAuth 端接受。
+        /// 成功返回 JSON 字符串；失败抛 ShangCloudApiException。
+        /// </summary>
+        public async Task<string> GetUserInfoAsync()
+        {
+            return await GetAsync("/oauth/userinfo");
         }
 
         /// <summary>
@@ -279,11 +292,34 @@ namespace ShangCloud.MMO.Api
 
         private void ApplyTokenResponse(OAuthTokenResponse token)
         {
-            AccessToken = token.AccessToken;
+            if (token == null) return;
+            if (!string.IsNullOrEmpty(token.AccessToken))
+                AccessToken = token.AccessToken.Trim();
             if (!string.IsNullOrEmpty(token.TokenType))
-                TokenType = token.TokenType;
+                TokenType = NormalizeTokenType(token.TokenType);
             if (!string.IsNullOrEmpty(token.RefreshToken))
-                RefreshToken = token.RefreshToken;
+                RefreshToken = token.RefreshToken.Trim();
+        }
+
+        private static string NormalizeTokenType(string tokenType)
+        {
+            if (string.IsNullOrWhiteSpace(tokenType)) return "Bearer";
+            tokenType = tokenType.Trim();
+            return tokenType.Equals("bearer", StringComparison.OrdinalIgnoreCase) ? "Bearer" : tokenType;
+        }
+
+        private void ApplyAuthHeader(HttpRequestMessage request)
+        {
+            if (string.IsNullOrWhiteSpace(AccessToken))
+                throw new ShangCloudApiException(401, "AccessToken is empty; login first");
+
+            // 仅发送 token 本身，不带 Bearer/TokenType（服务端按裸 token 校验）
+            string token = AccessToken.Trim();
+            if (token.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+                token = token.Substring(7).Trim();
+
+            if (!request.Headers.TryAddWithoutValidation("Authorization", token))
+                throw new ShangCloudApiException(401, "Failed to set Authorization header");
         }
 
         internal static void MakePkce(out string codeVerifier, out string codeChallenge)
@@ -328,20 +364,36 @@ namespace ShangCloud.MMO.Api
             return ((int)response.StatusCode, responseBody);
         }
 
+        private async Task<string> GetAsync(string path)
+        {
+            var url = _baseUrl + path;
+            var request = new HttpRequestMessage(HttpMethod.Get, url);
+            ApplyAuthHeader(request);
+            request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+
+            HttpResponseMessage response = await _httpClient.SendAsync(request);
+            string responseBody = await response.Content.ReadAsStringAsync();
+            if (!response.IsSuccessStatusCode)
+                throw new ShangCloudApiException((int)response.StatusCode, responseBody);
+            return responseBody;
+        }
+
         private async Task<string> PostAsync(string path, string jsonBody,
             string roomId = null, string protocol = null)
         {
             var url = _baseUrl + path;
             var request = new HttpRequestMessage(HttpMethod.Post, url)
             {
-                Content = new StringContent(jsonBody, Encoding.UTF8, "application/json")
+                Content = new StringContent(jsonBody ?? "{}", Encoding.UTF8, "application/json")
             };
 
-            request.Headers.TryAddWithoutValidation("Authorization", $"{TokenType} {AccessToken}");
+            ApplyAuthHeader(request);
+            request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
 
             if (!string.IsNullOrEmpty(roomId))
                 request.Headers.TryAddWithoutValidation("X-MMO-Room", roomId);
 
+            // 官方拼写即为 Protoctl（非 Protocol）
             if (!string.IsNullOrEmpty(protocol))
                 request.Headers.TryAddWithoutValidation("X-MMO-Protoctl", protocol);
 
@@ -354,6 +406,29 @@ namespace ShangCloud.MMO.Api
             }
 
             return responseBody;
+        }
+
+        /// <summary>解码 JWT payload（不验签），仅用于调试。</summary>
+        public static JObject TryDecodeJwtPayload(string jwt)
+        {
+            if (string.IsNullOrWhiteSpace(jwt)) return null;
+            try
+            {
+                var parts = jwt.Split('.');
+                if (parts.Length < 2) return null;
+                string payload = parts[1].Replace('-', '+').Replace('_', '/');
+                switch (payload.Length % 4)
+                {
+                    case 2: payload += "=="; break;
+                    case 3: payload += "="; break;
+                }
+                string json = Encoding.UTF8.GetString(Convert.FromBase64String(payload));
+                return JObject.Parse(json);
+            }
+            catch
+            {
+                return null;
+            }
         }
     }
 }
