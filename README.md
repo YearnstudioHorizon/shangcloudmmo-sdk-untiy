@@ -22,7 +22,7 @@
 在 `Packages/manifest.json` 的 `dependencies` 中添加：
 
 ```json
-"cn.yearnstudio.shangcloud.mmo": "https://your-git-url.git#path=shangcloud-sdk-mmo-unity"
+"cn.yearnstudio.shangcloud": "https://github.com/ShangCloudDev/sshangcloudmmo-sdk-unity"
 ```
 
 ## 架构概览
